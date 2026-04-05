@@ -1,15 +1,17 @@
-import asyncio,io,json,os,sqlite3,sys
+import asyncio,io,json,os,shutil,sqlite3,sys,tempfile
 from types import SimpleNamespace
 
 import pytest
 from IPython.core.inputtransformer2 import TransformerManager
 
+TEST_HOME = tempfile.mkdtemp(prefix="ipycodex-tests-")
+os.environ["XDG_CONFIG_HOME"] = TEST_HOME
+
 import ipycodex.core as core
 from ipycodex.core import (DEFAULT_CODE_THEME, DEFAULT_LOG_EXACT, DEFAULT_SEARCH, DEFAULT_SYSTEM_PROMPT, DEFAULT_THINK, EXTENSION_NS,
-    IPyAIExtension, LAST_PROMPT, LAST_RESPONSE, RESET_LINE_NS,
-    _extract_code_blocks, _format_var_xml, _git_repo_root, _list_sessions, _shell_names, _shell_refs,
-    _thinking_to_blockquote, _run_shell_refs, _var_names, _var_refs, astream_to_stdout,
-    prompt_from_lines, resume_session, transform_dots, transform_prompt_mode)
+    IPyAIExtension, LAST_PROMPT, LAST_RESPONSE, RESET_LINE_NS, _extract_code_blocks, _format_var_xml, _git_repo_root, _list_sessions,
+    _shell_names, _shell_refs, _thinking_to_blockquote, _run_shell_refs, _var_names, _var_refs, astream_to_stdout, prompt_from_lines,
+    resume_session, transform_dots, transform_prompt_mode)
 
 class DummyAsyncFormatter:
     async def format_stream(self, stream):
@@ -66,8 +68,7 @@ class DummyCodexClient:
         self.threads[tid] = dict(model=model, sp=sp, tools=tools, search=search, ephemeral=ephemeral)
         return tid
 
-    async def resume_thread(self, thread_id, *, sp=""):
-        return thread_id
+    async def resume_thread(self, thread_id, *, sp=""): return thread_id
 
     async def turn_stream(self, thread_id, prompt, *, ns=None, think=None, output_schema=None):
         self.turns.append(dict(thread_id=thread_id, prompt=prompt, ns=ns, think=think))
@@ -79,6 +80,19 @@ class DummyHistory:
         self.session_number = session_number
         self.db = sqlite3.connect(":memory:")
         self.entries = {}
+        with self.db:
+            self.db.execute("""CREATE TABLE sessions (
+                session INTEGER PRIMARY KEY,
+                start TIMESTAMP,
+                end TIMESTAMP,
+                num_cmds INTEGER DEFAULT 0,
+                remark TEXT)""")
+            self.db.execute("""CREATE TABLE history (
+                session INTEGER,
+                line INTEGER,
+                source TEXT)""")
+            self.db.execute("INSERT INTO sessions (session, start, end, num_cmds, remark) VALUES (?, CURRENT_TIMESTAMP, NULL, 0, ?)",
+                (session_number, None))
 
     def add(self, line, source, output=None): self.entries[line] = (source, output)
     def get_range(self, session=0, start=1, stop=None, raw=True, output=False):
@@ -123,20 +137,15 @@ class DummyShell:
 
 
 @pytest.fixture(autouse=True)
-def _config_paths(monkeypatch, tmp_path):
-    cfg_dir = tmp_path/"ipycodex"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(core, "CONFIG_DIR", cfg_dir)
-    monkeypatch.setattr(core, "CONFIG_PATH", cfg_dir/"config.json")
-    monkeypatch.setattr(core, "SYSP_PATH", cfg_dir/"sysp.txt")
-    monkeypatch.setattr(core, "LOG_PATH", cfg_dir/"exact-log.jsonl")
+def _config_paths(tmp_path):
+    if core.CONFIG_DIR.exists(): shutil.rmtree(core.CONFIG_DIR)
+    core.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @pytest.fixture
 def dummy_codex(monkeypatch):
     client = DummyCodexClient()
     monkeypatch.setattr(core, "get_codex_client", lambda: client)
-
     async def _fake_astream_to_stdout(stream, **kwargs): return "".join([o async for o in stream])
     monkeypatch.setattr(core, "astream_to_stdout", _fake_astream_to_stdout)
     return client
@@ -294,7 +303,7 @@ def test_codex_tables_are_created():
     tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
     assert "codex_prompts" in tables
     assert "codex_tools" in tables
-    assert "codex_sessions" in tables
+    assert "sessions" in tables
 
 
 def test_config_file_is_created_and_loaded():
@@ -753,18 +762,14 @@ def test_prompt_mode_flag():
     ext = IPyAIExtension(shell=shell, prompt_mode=True).load()
     assert ext.prompt_mode
 
-def test_prompt_mode_config_default(monkeypatch, tmp_path):
-    cfg = tmp_path / "config.json"
-    cfg.write_text('{"prompt_mode": true}')
-    monkeypatch.setattr(core, "CONFIG_PATH", cfg)
+def test_prompt_mode_config_default():
+    core.CONFIG_PATH.write_text('{"prompt_mode": true}')
     shell = DummyShell()
     ext = IPyAIExtension(shell=shell).load()
     assert ext.prompt_mode
 
-def test_prompt_mode_config_with_flag_toggles(monkeypatch, tmp_path):
-    cfg = tmp_path / "config.json"
-    cfg.write_text('{"prompt_mode": true}')
-    monkeypatch.setattr(core, "CONFIG_PATH", cfg)
+def test_prompt_mode_config_with_flag_toggles():
+    core.CONFIG_PATH.write_text('{"prompt_mode": true}')
     shell = DummyShell()
     ext = IPyAIExtension(shell=shell, prompt_mode=True).load()
     assert not ext.prompt_mode
@@ -814,7 +819,7 @@ def test_git_repo_root_none(tmp_path):
 
 def test_list_sessions_exact_match():
     db = _mk_sessions_db()
-    db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', '2025-01-01', 5, '/home/user/project')")
+    db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', '2025-01-01', 5, ?)", (json.dumps(dict(cwd="/home/user/project", provider="codex")),))
     db.execute("INSERT INTO sessions VALUES (2, '2025-01-02', '2025-01-02', 3, '/home/user/other')")
     rows = _list_sessions(db, "/home/user/project")
     assert len(rows) == 1
@@ -823,7 +828,7 @@ def test_list_sessions_exact_match():
 
 def test_list_sessions_with_prompts():
     db = _mk_sessions_db()
-    db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, 5, '/proj')")
+    db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, 5, ?)", (json.dumps(dict(cwd="/proj")),))
     db.execute("INSERT INTO codex_prompts (session, prompt, response, history_line) VALUES (1, 'first', 'r1', 0)")
     db.execute("INSERT INTO codex_prompts (session, prompt, response, history_line) VALUES (1, 'second', 'r2', 1)")
     rows = _list_sessions(db, "/proj")
@@ -833,8 +838,8 @@ def test_list_sessions_git_fallback(tmp_path):
     (tmp_path / ".git").mkdir()
     db = _mk_sessions_db()
     sub = str(tmp_path / "sub")
-    db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, 5, ?)", (str(tmp_path),))
-    db.execute("INSERT INTO sessions VALUES (2, '2025-01-02', NULL, 3, ?)", (sub,))
+    db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, 5, ?)", (json.dumps(dict(cwd=str(tmp_path), provider="codex")),))
+    db.execute("INSERT INTO sessions VALUES (2, '2025-01-02', NULL, 3, ?)", (json.dumps(dict(cwd=sub, provider="codex")),))
     rows = _list_sessions(db, sub)
     assert len(rows) == 1 and rows[0][0] == 2
     rows = _list_sessions(db, str(tmp_path / "newsub"))
@@ -842,7 +847,7 @@ def test_list_sessions_git_fallback(tmp_path):
 
 def test_resume_session():
     db = _mk_sessions_db()
-    db.execute("INSERT INTO sessions VALUES (5, '2025-01-01', '2025-01-01 12:00', 10, '/proj')")
+    db.execute("INSERT INTO sessions VALUES (5, '2025-01-01', '2025-01-01 12:00', 10, ?)", (json.dumps(dict(cwd="/proj", provider="codex")),))
     db.execute("INSERT INTO history VALUES (5, 1, 'x=1', 'x=1')")
     db.execute("INSERT INTO history VALUES (5, 2, 'y=2', 'y=2')")
     db.execute("INSERT INTO sessions VALUES (6, '2025-01-02', NULL, NULL, '')")
@@ -859,6 +864,18 @@ def test_resume_session():
     assert row[0] is None
     assert len(shell.history_manager.input_hist_parsed) == 3
 
+
+def test_reset_clears_provider_metadata_from_remark():
+    shell = DummyShell()
+    ext = IPyAIExtension(shell=shell).load()
+    with shell.history_manager.db:
+        shell.history_manager.db.execute("UPDATE sessions SET remark=? WHERE session=1",
+            (json.dumps(dict(cwd=os.getcwd(), provider="codex", provider_session_id="thread_1")),))
+    ext.reset_session_history()
+    row = shell.history_manager.db.execute("SELECT remark FROM sessions WHERE session=1").fetchone()
+    assert json.loads(row[0]) == {"cwd": os.getcwd()}
+
+
 def test_resume_session_not_found():
     db = _mk_sessions_db()
     db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, NULL, '')")
@@ -870,17 +887,14 @@ def test_resume_session_not_found():
 def test_store_cwd_in_remark():
     shell,ext = mk_ext()
     hm = shell.history_manager
-    hm.db.execute("CREATE TABLE IF NOT EXISTS sessions (session INTEGER PRIMARY KEY, start TEXT, end TEXT, num_cmds INTEGER, remark TEXT)")
-    hm.db.execute("INSERT INTO sessions VALUES (?, ?, NULL, NULL, '')", (hm.session_number, "2025-01-01"))
-    with hm.db: hm.db.execute("UPDATE sessions SET remark=? WHERE session=?", (os.getcwd(), hm.session_number))
+    with hm.db: hm.db.execute("UPDATE sessions SET remark=? WHERE session=?", (json.dumps(dict(cwd=os.getcwd())), hm.session_number))
     row = hm.db.execute("SELECT remark FROM sessions WHERE session=?", (hm.session_number,)).fetchone()
-    assert row[0] == os.getcwd()
+    assert json.loads(row[0]) == {"cwd": os.getcwd()}
 
 def test_handle_line_sessions():
     shell,ext = mk_ext()
     hm = shell.history_manager
-    hm.db.execute("CREATE TABLE IF NOT EXISTS sessions (session INTEGER PRIMARY KEY, start TEXT, end TEXT, num_cmds INTEGER, remark TEXT)")
-    hm.db.execute("INSERT INTO sessions VALUES (1, '2025-01-01', NULL, 5, ?)", (os.getcwd(),))
+    hm.db.execute("UPDATE sessions SET remark=?, num_cmds=5 WHERE session=1", (json.dumps(dict(cwd=os.getcwd(), provider="codex")),))
     hm.db.execute("INSERT INTO codex_prompts (session, prompt, response, history_line) VALUES (1, 'hello world', 'hi', 0)")
     import io as _io
     buf = _io.StringIO()

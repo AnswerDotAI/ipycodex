@@ -81,9 +81,31 @@ _TOOLS_SQL = """CREATE TABLE IF NOT EXISTS codex_tools (
     session INTEGER NOT NULL,
     toolname TEXT NOT NULL,
     PRIMARY KEY (session, toolname))"""
-_SESSIONS_SQL = """CREATE TABLE IF NOT EXISTS codex_sessions (
-    session INTEGER PRIMARY KEY,
-    thread_id TEXT NOT NULL)"""
+_CWD_KEY = "cwd"
+_PROVIDER_KEY = "provider"
+_PROVIDER_SESSION_KEY = "provider_session_id"
+
+
+def _session_meta(remark):
+    if not remark: return {}
+    try: meta = json.loads(remark)
+    except Exception: return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _session_remark(remark=None, **updates):
+    meta = _session_meta(remark)
+    for k,v in updates.items():
+        if v is None: meta.pop(k, None)
+        else: meta[k] = v
+    return json.dumps(meta, sort_keys=True) if meta else None
+
+
+def _update_session_remark(db, session_id, **updates):
+    if db is None: return
+    row = db.execute("SELECT remark FROM sessions WHERE session=?", (session_id,)).fetchone()
+    if not row: return
+    db.execute("UPDATE sessions SET remark=? WHERE session=?", (_session_remark(row[0], **updates), session_id))
 
 def _ensure_codex_tables(db):
     if db is None: return
@@ -95,13 +117,11 @@ def _ensure_codex_tables(db):
             db.execute(_PROMPTS_SQL)
         db.execute(f"CREATE INDEX IF NOT EXISTS idx_{PROMPTS_TABLE}_session_id ON {PROMPTS_TABLE} (session, id)")
         db.execute(_TOOLS_SQL)
-        db.execute(_SESSIONS_SQL)
 
 CONFIG_DIR = xdg_config_home()/"ipycodex"
 CONFIG_PATH = CONFIG_DIR/"config.json"
 SYSP_PATH = CONFIG_DIR/"sysp.txt"
 LOG_PATH = CONFIG_DIR/"exact-log.jsonl"
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 __all__ = """EXTENSION_ATTR EXTENSION_NS LAST_PROMPT LAST_RESPONSE MAGIC_NAME PROMPTS_TABLE RESET_LINE_NS DEFAULT_MODEL DEFAULT_COMPLETION_MODEL IPyAIExtension
 create_extension CONFIG_PATH SYSP_PATH LOG_PATH is_dot_prompt load_ipython_extension
@@ -332,8 +352,15 @@ def _default_config():
         search=DEFAULT_SEARCH, code_theme=DEFAULT_CODE_THEME, log_exact=DEFAULT_LOG_EXACT, prompt_mode=DEFAULT_PROMPT_MODE)
 
 
+def _ensure_config_dir(path=None):
+    path = Path(path or CONFIG_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.parent
+
+
 def load_config(path=None) -> dict:
     path = Path(path or CONFIG_PATH)
+    _ensure_config_dir(path)
     cfg = _default_config()
     if path.exists():
         data = json.loads(path.read_text())
@@ -352,6 +379,7 @@ def load_config(path=None) -> dict:
 
 def load_sysp(path=None) -> str:
     path = Path(path or SYSP_PATH)
+    _ensure_config_dir(path)
     if not path.exists(): path.write_text(DEFAULT_SYSTEM_PROMPT)
     return path.read_text()
 
@@ -399,9 +427,14 @@ def _git_repo_root(path):
         if (d / ".git").exists(): return str(d)
     return None
 
-_LIST_SQL = """SELECT s.session, s.start, s.end, s.num_cmds, s.remark,
-    (SELECT prompt FROM codex_prompts WHERE session=s.session ORDER BY id DESC LIMIT 1)
-    FROM sessions s WHERE s.remark{w} ORDER BY s.session DESC LIMIT 20"""
+_LIST_SQL = f"""SELECT s.session, s.start, s.end, s.num_cmds,
+    CASE WHEN json_valid(s.remark) THEN json_extract(s.remark, '$.{_CWD_KEY}') END,
+    (SELECT prompt FROM {PROMPTS_TABLE} WHERE session=s.session ORDER BY id DESC LIMIT 1)
+    FROM sessions s
+    WHERE CASE WHEN json_valid(s.remark) THEN json_extract(s.remark, '$.{_CWD_KEY}') END{{w}}
+      AND (CASE WHEN json_valid(s.remark) THEN json_extract(s.remark, '$.{_PROVIDER_KEY}') END='codex'
+        OR EXISTS (SELECT 1 FROM {PROMPTS_TABLE} p WHERE p.session=s.session))
+    ORDER BY s.session DESC LIMIT 20"""
 
 def _list_sessions(db, cwd):
     "Return recent sessions for `cwd`, falling back to git repo root exact match."
@@ -420,7 +453,7 @@ def _fmt_session(sid, start, ncmds, last_prompt, max_prompt=60):
 def _pick_session(rows):
     "Show an interactive session picker, return chosen session ID or None."
     from prompt_toolkit.shortcuts import radiolist_dialog
-    values = [(sid, _fmt_session(sid, start, ncmds, lp)) for sid,start,end,ncmds,remark,lp in rows]
+    values = [(sid, _fmt_session(sid, start, ncmds, lp)) for sid,start,end,ncmds,cwd,lp in rows]
     return radiolist_dialog(title="Resume session", text="Select a session to resume:", values=values, default=values[0][0]).run()
 
 def resume_session(shell, session_id):
@@ -571,18 +604,17 @@ class IPyAIExtension:
             await self._migrate_thread()
             return
         if self.db:
-            row = self.db.execute("SELECT thread_id FROM codex_sessions WHERE session=?", (self.session_number,)).fetchone()
-            if row:
+            row = self.db.execute("SELECT remark FROM sessions WHERE session=?", (self.session_number,)).fetchone()
+            meta = _session_meta(row[0]) if row else {}
+            if meta.get(_PROVIDER_KEY) == "codex" and meta.get(_PROVIDER_SESSION_KEY):
                 try:
-                    self._thread_id = await client.resume_thread(row[0], sp=self.system_prompt)
+                    self._thread_id = await client.resume_thread(meta[_PROVIDER_SESSION_KEY], sp=self.system_prompt)
                     return
                 except Exception: pass
         tools = self._get_tools()
         self._thread_id = await client.start_thread(model=self.model, sp=self.system_prompt, tools=tools, search=self.search)
         if self.db:
-            with self.db:
-                self.db.execute("INSERT OR REPLACE INTO codex_sessions (session, thread_id) VALUES (?,?)",
-                    (self.session_number, self._thread_id))
+            with self.db: _update_session_remark(self.db, self.session_number, cwd=os.getcwd(), provider="codex", provider_session_id=self._thread_id)
 
     async def _migrate_thread(self):
         "Start a new thread with updated tools, replaying conversation history."
@@ -591,15 +623,12 @@ class IPyAIExtension:
         client = get_codex_client()
         new_id = await client.start_thread(model=self.model, sp=self.system_prompt, tools=tools, search=self.search)
         if hist:
-            migration_prompt = (_history_xml(hist)
-                + "The above conversation has been migrated to this new thread. Respond with 'ok'.")
+            migration_prompt = _history_xml(hist) + "The above conversation has been migrated to this new thread. Respond with 'ok'."
             async for _ in client.turn_stream(new_id, migration_prompt, ns=self.shell.user_ns, think="l"): pass
         self._thread_id = new_id
         self._tools_dirty = False
         if self.db:
-            with self.db:
-                self.db.execute("INSERT OR REPLACE INTO codex_sessions (session, thread_id) VALUES (?,?)",
-                    (self.session_number, new_id))
+            with self.db: _update_session_remark(self.db, self.session_number, cwd=os.getcwd(), provider="codex", provider_session_id=new_id)
 
     def _register_tool(self, name):
         "Register a tool from user_ns for the current session."
@@ -667,7 +696,9 @@ class IPyAIExtension:
     def reset_session_history(self) -> int:
         if self.db is None: return 0
         self.ensure_tables()
-        with self.db: cur = self.db.execute(f"DELETE FROM {PROMPTS_TABLE} WHERE session=?", (self.session_number,))
+        with self.db:
+            cur = self.db.execute(f"DELETE FROM {PROMPTS_TABLE} WHERE session=?", (self.session_number,))
+            _update_session_remark(self.db, self.session_number, cwd=os.getcwd(), provider=None, provider_session_id=None)
         self.shell.user_ns.pop(LAST_PROMPT, None)
         self.shell.user_ns.pop(LAST_RESPONSE, None)
         self.shell.user_ns[RESET_LINE_NS] = self.current_prompt_line()
@@ -949,7 +980,7 @@ def create_extension(shell=None, resume=None, load=None, prompt_mode=False, **kw
             print(f"Loaded {ncode} code cells and {nprompt} prompts from {path}.")
         except FileNotFoundError as e: print(str(e))
     hm = shell.history_manager
-    with hm.db: hm.db.execute("UPDATE sessions SET remark=? WHERE session=?", (os.getcwd(), hm.session_number))
+    with hm.db: _update_session_remark(hm.db, hm.session_number, cwd=os.getcwd())
     if not getattr(shell, '_ipycodex_atexit', False):
         sid = hm.session_number
         atexit.register(lambda: print(f"\nTo resume: ipycodex -r {sid}"))

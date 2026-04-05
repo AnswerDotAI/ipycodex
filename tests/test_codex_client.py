@@ -22,7 +22,7 @@ async def _aiter(*items):
 
 async def test_asyncchat_ephemeral(monkeypatch):
     fake = FakeClient()
-    monkeypatch.setattr(cc, "get_codex_client", lambda: fake)
+    monkeypatch.setattr(cc, "_client", fake)
     chat = cc.AsyncChat(model="gpt-5.4", sp="system")
 
     res = await chat("prompt", think="m")
@@ -91,15 +91,11 @@ async def test_consume_turn_emits_thinking_events():
     client = cc._CodexAppServer()
     client.events = asyncio.Queue()
     thread_id,turn_id = "thread_1","turn_1"
-    msgs = [
-        dict(method="item/started", params=dict(threadId=thread_id, turnId=turn_id,
-            item=dict(type="reasoning", id="r_1"))),
+    msgs = [dict(method="item/started", params=dict(threadId=thread_id, turnId=turn_id, item=dict(type="reasoning", id="r_1"))),
         dict(method="item/reasoning/textDelta", params=dict(threadId=thread_id, turnId=turn_id, itemId="r_1", contentIndex=0, delta="let me ")),
         dict(method="item/reasoning/textDelta", params=dict(threadId=thread_id, turnId=turn_id, itemId="r_1", contentIndex=0, delta="think")),
-        dict(method="item/completed", params=dict(threadId=thread_id, turnId=turn_id,
-            item=dict(type="reasoning", id="r_1"))),
-        dict(method="item/started", params=dict(threadId=thread_id, turnId=turn_id,
-            item=dict(type="agentMessage", id="msg_1"))),
+        dict(method="item/completed", params=dict(threadId=thread_id, turnId=turn_id, item=dict(type="reasoning", id="r_1"))),
+        dict(method="item/started", params=dict(threadId=thread_id, turnId=turn_id, item=dict(type="agentMessage", id="msg_1"))),
         dict(method="item/agentMessage/delta", params=dict(threadId=thread_id, turnId=turn_id, itemId="msg_1", delta="Hello")),
         dict(method="turn/completed", params=dict(threadId=thread_id, turnId=turn_id, turn=dict(id=turn_id)))]
     for msg in msgs: await client.events.put(msg)
@@ -117,11 +113,7 @@ async def test_async_stream_formatter_thinking_blockquotes_display_and_stores_ta
     fmt = cc.AsyncStreamFormatter()
     fmt.is_tty = True
     seen = []
-    stream = _aiter(
-        dict(kind="thinking_start"),
-        dict(kind="thinking_delta", delta="hmm"),
-        dict(kind="thinking_end"),
-        "Hello")
+    stream = _aiter(dict(kind="thinking_start"), dict(kind="thinking_delta", delta="hmm"), dict(kind="thinking_end"), "Hello")
     async for _ in fmt.format_stream(stream): seen.append(fmt.display_text)
 
     assert any("> hmm" in o for o in seen)

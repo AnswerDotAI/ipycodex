@@ -55,7 +55,7 @@ Implemented:
 - XDG-backed config, startup, and system prompt files
 - optional exact raw prompt/response logging
 - skill eval blocks: `#| eval: true` python code blocks in skills are executed via `shell.run_cell` when loaded
-- per-directory session persistence: CWD stored in IPython `sessions.remark`, session resume via `resume_session()`
+- per-directory session persistence: JSON stored in IPython `sessions.remark` with `cwd`, `provider`, and `provider_session_id`, session resume via `resume_session()`
 - interactive session picker via `prompt_toolkit.radiolist_dialog` for `ipycodex -r`
 - `%ipycodex sessions` command listing resumable sessions with last prompt preview
 - `ipycodex` CLI entry point (console script) launching IPython with ipythonng + ipycodex + output history
@@ -117,7 +117,7 @@ The `<context>` block contains all non-`ipycodex` code run since the previous AI
 The extension lifecycle is:
 
 1. `%load_ext ipycodex` calls `load_ipython_extension`, which parses `IPYTHONNG_FLAGS` and delegates to `create_extension`.
-2. `create_extension` ensures the `ai_prompts` table exists, optionally resumes a session (or shows the interactive picker), creates the extension, stores CWD in `sessions.remark`, and registers the atexit handler.
+2. `create_extension` ensures the prompt/tool tables exist, optionally resumes a session (or shows the interactive picker), creates the extension, stores session metadata JSON in `sessions.remark`, and registers the atexit handler.
 3. `IPyAIExtension.__init__` loads config, system prompt, discovers skills, and loads the startup file.
 4. `IPyAIExtension.load()` registers `%ipycodex` / `%%ipycodex`, inserts a cleanup transform into IPython's `input_transformer_manager.cleanup_transforms`, registers keybindings, and applies `startup.ipynb` if the session is still fresh.
 4. Any cell whose first character is `.` is rewritten by `transform_dots()` into `get_ipython().run_cell_magic('ipycodex', '', prompt)`.
@@ -200,7 +200,7 @@ Legacy `startup.json` files (pre-notebook format) are still supported for loadin
 
 ## Session Persistence And Resume
 
-`ipycodex` stores the working directory in IPython's `sessions.remark` column (an unused TEXT field) at extension load time. This enables per-directory session listing and resume.
+`ipycodex` stores JSON in IPython's `sessions.remark` column, including the working directory plus provider metadata. This enables per-directory session listing and backend resume without owning any extra IPython tables.
 
 Key functions:
 
